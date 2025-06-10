@@ -5,22 +5,22 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"time"
 )
 
-// Metrics holds performance data for a single node.
 type Metrics struct {
 	Commits       int
 	BytesSent     int64
 	ViewChanges   int
-	LatencyValues []float64 // in milliseconds
+	LatencyValues []float64
 	mux           sync.RWMutex
 }
 
-func (m *Metrics) AddCommit(latency float64) {
+func (m *Metrics) AddCommit(latency time.Duration) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
 	m.Commits++
-	m.LatencyValues = append(m.LatencyValues, latency)
+	m.LatencyValues = append(m.LatencyValues, float64(latency.Milliseconds()))
 }
 
 func (m *Metrics) AddBytesSent(bytes int) {
@@ -35,7 +35,6 @@ func (m *Metrics) IncViewChanges() {
 	m.ViewChanges++
 }
 
-// PrintAsCSV prints the final aggregated results in CSV format.
 func (r *SimulationResult) PrintAsCSV() {
 	avgLatency := 0.0
 	if len(r.LatencyValues) > 0 {
@@ -46,19 +45,18 @@ func (r *SimulationResult) PrintAsCSV() {
 		avgLatency = sum / float64(len(r.LatencyValues))
 	}
 
-	// Throughput in bits per second
 	throughputBps := float64(r.TotalCommits*r.Config.BlockSize*8) / r.Config.SimDuration.Seconds()
-	if math.IsNaN(throughputBps) {
+	if math.IsNaN(throughputBps) || math.IsInf(throughputBps, 0) {
 		throughputBps = 0
 	}
 
-	fmt.Printf("%s,%s,%d,%d,%.2f,%d,%.2f,%.2f,%d\n",
+	fmt.Printf("%s,%d,%s,%d,%d,%.2f,%.2f,%.2f,%d\n",
 		r.Config.Name,
+		r.Config.RunID,
 		r.Config.Protocol,
 		r.Config.NumNodes,
 		r.Config.BlockSize,
 		r.Config.PacketLossProb,
-		len(r.Config.StragglerNodes),
 		throughputBps,
 		avgLatency,
 		r.TotalViewChanges,
