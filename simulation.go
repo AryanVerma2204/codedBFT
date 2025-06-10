@@ -2,10 +2,9 @@
 package main
 
 import (
-	"fmt"
+	"crypto/sha256"
 	"log"
 	"math/rand"
-	"os"
 	"sync"
 	"time"
 )
@@ -19,7 +18,6 @@ type Simulation struct {
 }
 
 func NewSimulation(config ExperimentConfig) *Simulation {
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	return &Simulation{
 		config: config,
 		stop:   make(chan struct{}),
@@ -27,12 +25,7 @@ func NewSimulation(config ExperimentConfig) *Simulation {
 }
 
 func (s *Simulation) Run() *SimulationResult {
-	log.Printf("--- Starting Experiment: %s | Protocol: %s | Nodes: %d ---", s.config.Name, s.config.Protocol, s.config.NumNodes)
-
-	// Clean up old DB files for a fresh start
-	for i := 0; i < s.config.NumNodes; i++ {
-		os.Remove(fmt.Sprintf("node_%s_%d.db", s.config.Protocol, i))
-	}
+	log.Printf("--- Running: %s | RunID: %d | Protocol: %s | Nodes: %d | Loss: %.2f%% ---", s.config.Name, s.config.RunID, s.config.Protocol, s.config.NumNodes, s.config.PacketLossProb*100)
 
 	s.net = NewSimulatedNetwork(s.config)
 	s.nodes = make([]*Node, s.config.NumNodes)
@@ -49,29 +42,32 @@ func (s *Simulation) Run() *SimulationResult {
 	time.Sleep(s.config.SimDuration)
 	close(s.stop) // Signal all goroutines to stop
 
-	// Collect results
 	return s.collectResults()
 }
 
 func (s *Simulation) clientProposer() {
-	currentLeader := 0
-	ticker := time.NewTicker(50 * time.Millisecond) // Propose frequently
+	// A simple client that continuously proposes new blocks to the current leader
+	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			block := make([]byte, s.config.BlockSize)
-			rand.Read(block)
+			// In each round, a different node acts as leader to distribute load
+			leaderID := s.nodes[0].GetCurrentView() % s.config.NumNodes
+			leaderNode := s.nodes[leaderID]
 
-			// Find the current leader to propose to
-			// In a real system, a client would have more robust leader discovery
-			leaderNode := s.nodes[currentLeader]
 			if leaderNode != nil && !leaderNode.IsStopped() {
+				blockData := make([]byte, s.config.BlockSize)
+				rand.Read(blockData)
+				block := Block{
+					ID:        sha256.Sum256(blockData),
+					Proposer:  leaderID,
+					Timestamp: time.Now(),
+					Data:      blockData,
+				}
 				leaderNode.Propose(block)
 			}
-			// Simple round-robin leader assumption for client
-			currentLeader = (currentLeader + 1) % s.config.NumNodes
 		case <-s.stop:
 			return
 		}
@@ -91,22 +87,20 @@ func (s *Simulation) collectResults() *SimulationResult {
 
 	for _, node := range s.nodes {
 		metrics := node.GetMetrics()
-		// We only count commits from one node to avoid duplication
-		if node.id == 1 {
+		if node.id == 1 { // Collect detailed stats from one arbitrary node
 			totalCommits = metrics.Commits
 			allLatencies = append(allLatencies, metrics.LatencyValues...)
 		}
 		totalBytesSent += metrics.BytesSent
 		totalViewChanges += metrics.ViewChanges
 	}
-	// Average view changes across the cluster
-	totalViewChanges /= s.config.NumNodes
+	totalViewChanges /= s.config.NumNodes // Average view changes across the cluster
 
 	return &SimulationResult{
-		Config:          s.config,
-		TotalCommits:    totalCommits,
-		TotalBytesSent:  totalBytesSent,
+		Config:           s.config,
+		TotalCommits:     totalCommits,
+		TotalBytesSent:   totalBytesSent,
 		TotalViewChanges: totalViewChanges,
-		LatencyValues:   allLatencies,
+		LatencyValues:    allLatencies,
 	}
 }
