@@ -8,6 +8,7 @@ const (
 	MB = 1024 * KB
 )
 
+// ProtocolType defines the consensus algorithm to be used.
 type ProtocolType string
 
 const (
@@ -19,6 +20,7 @@ const (
 // ExperimentConfig holds all parameters for a single simulation run.
 type ExperimentConfig struct {
 	Name             string
+	RunID            int
 	Protocol         ProtocolType
 	NumNodes         int
 	NumFaulty        int
@@ -27,21 +29,14 @@ type ExperimentConfig struct {
 	NetworkLatency   time.Duration
 	PacketLossProb   float64
 	SimDuration      time.Duration
-	StragglerNodes   map[int]StragglerConfig
 	ConsensusTimeout time.Duration
 }
 
-// StragglerConfig defines properties for slow/unreliable nodes.
-type StragglerConfig struct {
-	ExtraLatency     time.Duration
-	BandwidthLimitBps int // Bytes per second
-}
-
-// SimulationResult holds the metrics collected from a run.
+// SimulationResult holds the aggregated metrics collected from a run.
 type SimulationResult struct {
-	Config          ExperimentConfig
-	TotalCommits    int
-	TotalBytesSent  int64
+	Config           ExperimentConfig
+	TotalCommits     int
+	TotalBytesSent   int64
 	TotalViewChanges int
-	LatencyValues   []float64
+	LatencyValues    []float64
 }
