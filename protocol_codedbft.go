@@ -3,6 +3,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -13,43 +14,31 @@ type CodedBFTProtocol struct {
 	speculativeExecutionEnabled bool
 	metrics                     Metrics
 	stopChan                    chan struct{}
-
-	mux         sync.RWMutex
-	currentView int
-	decoder     *Decoder
-	votes       map[[32]byte]map[int]struct{}
-	committed   map[[32]byte]bool
+	mux                         sync.RWMutex
+	currentView                 int
+	decoders                    map[[32]byte]*Decoder
+	votes                       map[[32]byte]map[int]struct{}
+	committed                   map[[32]byte]bool
 }
 
 func (p *CodedBFTProtocol) Init(node *Node) {
 	p.node = node
 	p.stopChan = make(chan struct{})
-	p.committed = make(map[[32]byte]bool)
+	p.decoders = make(map[[32]byte]*Decoder)
 	p.votes = make(map[[32]byte]map[int]struct{})
+	p.committed = make(map[[32]byte]bool)
 }
 
-func (p *CodedBFTProtocol) Propose(blockData []byte) {
-	p.mux.Lock()
-	view := p.currentView
-	p.mux.Unlock()
+func (p *CodedBFTProtocol) Propose(block Block) {
+	view := p.GetCurrentView()
+	if p.node.id != view%p.node.config.NumNodes { return } // Only leaders propose
 
-	block := Block{
-		ID:        sha256.Sum256(blockData), // Using data hash as ID for simplicity
-		Proposer:  p.node.id,
-		View:      view,
-		Timestamp: time.Now(),
-		Data:      blockData,
-	}
 	hash := sha256.Sum256(block.Data)
-
 	encoder, err := NewEncoder(block.Data, p.node.config.PacketSize)
-	if err != nil {
-		log.Printf("[Node %d] Encoder error: %v", p.node.id, err)
-		return
-	}
+	if err != nil { return }
 
-	// In a real system, this would continue until a commit is observed
-	for i := 0; i < len(block.Data)/p.node.config.PacketSize+20; i++ {
+	numPackets := len(block.Data)/p.node.config.PacketSize + 20 // Send with overhead
+	for i := 0; i < numPackets; i++ {
 		packet := encoder.GetEncodedPacket()
 		payload := &ProposalPacket{View: view, BlockID: block.ID, Hash: hash, Packet: packet}
 		p.node.net.Broadcast(p.node.id, payload)
@@ -63,57 +52,57 @@ func (p *CodedBFTProtocol) HandleMessage(msg Message) {
 
 	switch payload := msg.Payload.(type) {
 	case *ProposalPacket:
-		if payload.View < p.currentView {
-			return
+		if payload.View < p.currentView || p.committed[payload.Hash] { return }
+		if _, ok := p.decoders[payload.BlockID]; !ok {
+			p.decoders[payload.BlockID] = NewDecoder()
 		}
-		if p.decoder == nil {
-			p.decoder = NewDecoder()
-		}
-		if p.decoder.AddPacket(payload.Packet) {
-			decodedData, err := p.decoder.GetDecodedData()
-			if err != nil || sha256.Sum256(decodedData) != payload.Hash {
-				return // Invalid decode
-			}
-			p.decoder = nil // Reset for next block
-
-			// This is the speculative execution step
+		if p.decoders[payload.BlockID].AddPacket(payload.Packet) {
+			decodedData, err := p.decoders[payload.BlockID].GetDecodedData()
+			delete(p.decoders, payload.BlockID)
+			if err != nil || sha256.Sum256(decodedData) != payload.Hash { return }
+			
 			if p.speculativeExecutionEnabled {
 				vote := &VoteMsg{View: payload.View, BlockID: payload.BlockID, Hash: payload.Hash}
 				p.node.net.Broadcast(p.node.id, vote)
-				p.metrics.AddBytesSent(68) // Approx size of VoteMsg
+				p.metrics.AddBytesSent(68)
 			}
 		}
-
 	case *VoteMsg:
-		if payload.View < p.currentView {
-			return
-		}
+		if payload.View < p.currentView || p.committed[payload.Hash] { return }
 		if _, ok := p.votes[payload.Hash]; !ok {
 			p.votes[payload.Hash] = make(map[int]struct{})
 		}
 		p.votes[payload.Hash][msg.From] = struct{}{}
-
+		
 		quorum := 2*p.node.config.NumFaulty + 1
-		if len(p.votes[payload.Hash]) >= quorum && !p.committed[payload.Hash] {
+		if len(p.votes[payload.Hash]) >= quorum {
 			p.committed[payload.Hash] = true
-			latency := time.Since(time.Unix(0, 0)).Milliseconds() // Simplified latency
-			p.metrics.AddCommit(float64(latency))
-			log.Printf("[Node %d] CodedBFT: Committed block %x in view %d", p.node.id, payload.Hash[:6], payload.View)
+			log.Printf("[Node %d] CodedBFT: Committed block %x", p.node.id, payload.Hash[:4])
+			p.metrics.AddCommit(time.Since(time.Now())) // Simplified
 		}
 	}
 }
 
-func (p *CodedBFTProtocol) Start() {
-	defer p.node.wg.Done()
+func (p *CodedBFTProtocol) Start(wg *sync.WaitGroup) {
+	defer wg.Done()
+	timeout := time.NewTimer(p.node.config.ConsensusTimeout)
 	for {
 		select {
 		case msg := <-p.node.net.GetChannel(p.node.id):
+			timeout.Reset(p.node.config.ConsensusTimeout)
 			p.HandleMessage(msg)
+		case <-timeout.C:
+			p.mux.Lock()
+			p.currentView++
+			p.metrics.IncViewChanges()
+			log.Printf("[Node %d] CodedBFT: Timeout, moving to view %d", p.node.id, p.currentView)
+			p.mux.Unlock()
+			timeout.Reset(p.node.config.ConsensusTimeout)
 		case <-p.stopChan:
 			return
 		}
 	}
 }
-
-func (p *CodedBFTProtocol) Stop()       { close(p.stopChan) }
-func (p *CodedBFTProtocol) GetMetrics() Metrics { return p.metrics }
+func (p *CodedBFTProtocol) Stop() { close(p.stopChan) }
+func (p *CodedBFTProtocol) GetMetrics() *Metrics { return &p.metrics }
+func (p *CodedBFTProtocol) GetCurrentView() int { p.mux.RLock(); defer p.mux.RUnlock(); return p.currentView }
